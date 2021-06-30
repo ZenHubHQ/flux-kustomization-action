@@ -1,0 +1,51 @@
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# !!!!!!!!!!!!!! This repository is public !!!!!!!!!!!!!!!!!!!!!!!!
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+# repo is public until Github Action supports cloning private repos
+# https://github.com/github/roadmap/issues/74
+name: 'Build and Push Docker images'
+description: 'Build and Push Docker images via CloudBuild running Kaniko for multi stage cache'
+inputs:
+  image:
+    description: 'full Docker image/tag to push'
+    required: true
+  cacheRepo:
+    description: 'Docker repository to use as cache'
+    required: true
+  config:
+    description: 'GCP Cloud Build configuration file location'
+    required: true
+  buildArgs:
+    description: 'multine string or build args with one line per arg as KEY=VALUE'
+    required: false
+outputs:
+  image:
+    description: "image pushed, same as input.push"
+    value: ${{ steps.build.outputs.image }}
+runs:
+  using: "composite"
+  steps:
+    - name: "Docker Build"
+      id: build
+      shell: bash
+      run: |
+        set -e
+        echo "Trigger Docker build for '${{ inputs.image }}' using configuration '${{ inputs.config }}' and build args : "
+        buildArgs="${{ inputs.buildArgs }}"
+        substitutions=""
+        for buildArg in ${buildArgs}; do
+          echo "--- $buildArg"
+          # the underscore and the comma are required to make it a valid Cloudbuild subsitution
+          substitutions="${substitutions}_${buildArg},"
+        done
+        echo $substitutions
+
+        set -x
+        gcloud --project zenhub-ops builds submit . --gcs-source-staging-dir=gs://ops-cloudbuild-bucket/data --gcs-log-dir=gs://ops-cloudbuild-bucket/logs \
+           --config ${{ inputs.config }} \
+           --timeout 1h \
+           --substitutions _CACHE_REPO=${{ inputs.cacheRepo }},_IMAGE=${{ inputs.image }},${substitutions}
+        set +x
+
+        echo "::set-output name=image::${{ inputs.image }}"

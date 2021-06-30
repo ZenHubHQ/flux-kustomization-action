@@ -1,0 +1,3 @@
+First Release
+* build Docker images using CloudBiuld and Kaniko
+* wait for one Job to be started before tailing its logs before asserting its final state

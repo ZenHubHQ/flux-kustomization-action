@@ -1,0 +1,36 @@
+name: Continuous Deployment
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  CreateUpdateGitTag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cancel Previous Runs
+        uses: styfle/cancel-workflow-action@0.9.0
+        with:
+          access_token: ${{ github.token }}
+
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: "Tag"
+        run: |
+          set -x
+          set -e
+
+          git config --global user.email "devops@zenhub.com"
+          git config --global user.name "DevOps CI"
+
+          version=$(cat release_version)
+          note=$(cat release_note)
+          echo ".. delete tag $version.. (errors means it doesn't exist)"
+          git fetch --tags
+          git tag -d $version || true
+          git push --delete origin $version || true
+
+          echo " .. add tag $version"
+          git tag -a -m "$note" $version
+          git push --follow-tags
