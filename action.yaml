@@ -1,0 +1,186 @@
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# !!!!!!!!!!!!!! This repository is public !!!!!!!!!!!!!!!!!!!!!!!!
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+# repo is public until Github Action supports cloning private repos
+# https://github.com/github/roadmap/issues/74
+
+# type dispatch
+# produces the following (once converted to yaml) from flux/live/<cluster_name>.<friendly_name>.yaml
+#        fluxResource: [ staging.runner-for-cd.yaml ]
+#        include:
+#          - fluxResource: staging.runner-for-cd.yaml
+#            runs-on: [ staging_cluster, suitable_for_runner_cd ]
+#          - fluxResource: dev.sample-cloud.yaml
+#            runs-on: [ dev_cluster, suitable_for_runner_cd ]
+
+# type skip
+# output skip=yes is the given fluxKustomization is configured with a fluxGitRepository whose ref is not given 'baseBranch'
+# meaning whatever changes made on given 'baseBranch' would not be picked by Flux
+
+# type diff
+# read the given fluxKustomization and expect to find the associated Kustomizations path locally to perform a diff
+# for it to work nicely, the given fluxKustomization should not contains any Kustomize override (like targetNamespace, commonLabels...)
+
+# type wait
+# given fluxKustomization, check its sync status is on the given baseBranch/sha, it waits until Flux manage to sync the Kustomizations
+# while regularly printing the current status
+
+
+name: 'FluxKustomizationDiffandWait'
+description: 'For a given FluxKustomization kind either produces a diff or wait for its sync status to be complete. Can also be used to scan a directory for valid FluxKustomization. See various inputs to know how to use it'
+inputs:
+  type:
+    description: 'Either "dispatch" or "skip" or "diff" or "wait". Dispatch scans "fluxLiveDirectory", Skip makes sure the FluxKustomization is concerned "baseBranch", Diff relies on locally found Kustomizations infered from  "fluxKustomization", Wait check the sync status of "fluxKustomization" in accordance to "baseBranch" and "sha"'
+    required: true
+  fluxLiveDirectory:
+    description: "Required if 'dispatch'. Where can be find the Flux Kustomization resources, one Kind per file named <target_cluster>.<friendly_name>.yaml"
+    required: false
+    default: 'flux/live'
+  baseBranch:
+    description: "Required if 'skip' or 'wait'. steps.set_git_sha.outputs.baseBranch, which is base branch for pull request event or just branch for pull event"
+    required: false
+  fluxKustomization:
+    description: "Required if 'skip' or 'wait' or 'diff'. File containing one Flux/Kustomization kind"
+    required: false
+  sha:
+    description: "Required if 'wait'. steps.set_git_sha.outputs.sha"
+    required: false
+outputs:
+  fluxResource:
+    description: "Produced by 'dispatch'. Matrix of all the FLux/Kustomization found, goes with 'include'. "
+    value: ${{ steps.dispatch.outputs.fluxResource }}
+  include:
+    description: "Produced by 'dispatch'. Annotation for the fluxResource output which define the 'runs-on' to target a cluster"
+    value: ${{ steps.dispatch.outputs.include }}
+  skip:
+    description: "Produced by 'skip'. 'yes' if the current baseBranch doesn't concern the given fluxKustomization"
+    value: ${{ steps.skip.outputs.skip }}
+  diff:
+    description: "Produced by 'diff'. Contains the full Kubectl diff or plain text if no diff"
+    value: ${{ steps.diff.outputs.diff }}
+  kustomizeBase:
+    description: "Produced by 'diff'. Which Kustomize base has been diffed (read from the Flux/Kustomization)"
+    value: ${{ steps.diff.outputs.kustomizeBase }}
+runs:
+  using: "composite"
+  steps:
+    - name: "Dispatch"
+      id: dispatch
+      shell: bash
+      run: |
+        set -e
+        set -x
+        [[ "${{ inputs.type }}" != "dispatch" ]] && exit 0
+        echo "## Running Dispatch : parsing ${{ inputs.fluxLiveDirectory }}/*.yaml to build a Matrix which can be fed to a Action Job"
+
+        fluxResource="["
+        include="["
+        for item in $(ls -d ${{ inputs.fluxLiveDirectory }}/*.yaml); do
+          echo "## ## file ${item}"
+          echo "## ## ## which target cluster ? "
+          fileName=${item##*/}
+          clusterName=${fileName%%.*}
+          [[ "${clusterName}" == "" ]] && echo "WARNING : file '${item}' doesn't follow '<cluster>.<friendly_name>.yaml' pattern, ignoring it" && continue
+          fluxResource="${fluxResource} \"${item}\","
+          include="${include}  { \"fluxResource\": \"${item}\", \"runs-on\":  [ \"${clusterName}_cluster\", \"suitable_for_cd\" ] }  ,"
+        done
+        fluxResource=${fluxResource::-1}
+        fluxResource="${fluxResource} ]"
+        include=${include::-1}
+        include="${include} ]"
+        echo $fluxResource
+        echo $include
+        echo "::set-output name=fluxResource::${fluxResource}"
+        echo "::set-output name=include::${include}"
+
+    - name: "Skip"
+      id: skip
+      shell: bash
+      run: |
+        set -e
+        set -x
+        [[ "${{ inputs.type }}" != "skip" ]] && exit 0
+        echo "## Does the GitRepository associated to ${{ inputs.fluxKustomization }} is monitoring the current branch '${{ inputs.baseBranch }}' ?"
+        targetRefBranch=$(kubectl -n $(kubectl get -f ${{ inputs.fluxKustomization }} -o jsonpath='{.spec.sourceRef.namespace}') get \
+            $(kubectl get -f ${{ inputs.fluxKustomization }} -o jsonpath='{.spec.sourceRef.kind}')/$(kubectl get -f ${{ inputs.fluxKustomization }} -o jsonpath='{.spec.sourceRef.name}') \
+            -o jsonpath='{.spec.ref.branch}')
+        [[ "${targetRefBranch}" == "" ]] && echo "Error : couldnot find associated GitRepository with a spec.ref.branch" && exit 1
+
+        if [[ "${targetRefBranch}" != "${{ inputs.baseBranch }}" ]]; then
+          echo "## the associated GitRepository is not configured to monitor the current branch. Any following steps can be skipped."
+          echo "::set-output name=skip::yes"
+        else
+          echo "## the associated GitRepository is configured to monitor the current branch. Good to go with following steps"
+          echo "::set-output name=skip::no"
+        fi
+        
+
+    - name: "Diff"
+      id: diff
+      shell: bash
+      run: |
+        set -e
+        set -x
+        [[ "${{ inputs.type }}" != "diff" ]] && exit 0        
+
+        echo "## Perform diff"
+
+        # because of so much noises in kubectl diff (looking at the 'managedFields' annotation), there will always be
+        # a diff according to kubectl, so we use a custom diff script and check the content of the diff result (the file)
+        # once the custom diff script has been applied. If diff file is empty, no diff to apply for real
+        export KUBECTL_EXTERNAL_DIFF=/home/runner/kubectl-neat-diff
+        [[ ! -f ${KUBECTL_EXTERNAL_DIFF} ]] && echo "ERROR: diff script '${KUBECTL_EXTERNAL_DIFF}' can't be found, are you using the right Runner image ?" && exit 1
+        kustomizeBase=$(kubectl get -f ${{ inputs.fluxKustomization }} -o jsonpath="{.spec.path}")
+        echo "Kustomization read from ${{ inputs.fluxKustomization }} is ${kustomizeBase}"
+        # FIXME remove the --load_restrictor=none once all bases are refactored like raptor
+        kustomize build --load_restrictor=none ${kustomizeBase} > build.yaml
+        set +e
+        # FIXME until we manage to dry-run runnerDeployment
+        kubectl diff -f build.yaml --selector="no-dry-run-support!=unfornutately-yes" > diff
+        diffExitStatus=$?
+        set -e
+        if [[ "${diffExitStatus}" == "0" ]]; then
+          echo "There is no Diff"
+          cat <<EOF > diff
+        No diff with target resources, there is nothing to review.
+        EOF
+        elif [[ "${diffExitStatus}" == "1" ]]; then
+          echo "There is a Diff"
+        else
+          echo "diff error, exit now"
+          cat diff || true
+          exit $diffExitStatus
+        fi
+
+        diff="$(cat diff)"
+        diff="${diff//'%'/'%25'}"
+        diff="${diff//$'\n'/'%0A'}"
+        diff="${diff//$'\r'/'%0D'}"
+        echo "::set-output name=diff::$diff"
+        echo "::set-output name=kustomizeBase::$kustomizeBase"
+
+    - name: "Wait"
+      id: wait
+      shell: bash
+      run: |
+        set -e
+        [[ "${{ inputs.type }}" != "wait" ]] && exit 0
+
+        echo "## Perform wait"
+
+        echo "## Flux should soon pick the changes (if not already)"
+        echo "   waiting to sync to '${{ inputs.baseBranch}}/${{inputs.sha}}'"
+        kubectl get -f ${{ inputs.fluxKustomization }}
+        echo ""
+        while [[ "$(kubectl get -f ${{ inputs.fluxKustomization }} -o jsonpath='{.status.lastAppliedRevision}')" != "${{ inputs.baseBranch}}/${{inputs.sha}}" ]]; do
+            kubectl get -f ${{ inputs.fluxKustomization }}
+            echo "..................... waiting ....................."
+            sleep 10
+        done
+
+        echo "## Flux successfully reconcilied '${{ inputs.fluxKustomization }}' to commit '${{ inputs.baseBranch}}/${{inputs.sha}}'"
+        echo "kubectl describe -f ${{ inputs.fluxKustomization }}"
+        kubectl describe -f ${{ inputs.fluxKustomization }} || true
+        echo ""
+        exit 0
