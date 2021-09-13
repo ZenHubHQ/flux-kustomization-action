@@ -70,7 +70,6 @@ runs:
       shell: bash
       run: |
         set -e
-        set -x
         [[ "${{ inputs.type }}" != "dispatch" ]] && exit 0
         echo "## Running Dispatch : parsing ${{ inputs.fluxLiveDirectory }}/*.yaml to build a Matrix which can be fed to a Action Job"
 
@@ -121,7 +120,6 @@ runs:
       shell: bash
       run: |
         set -e
-        set -x
         [[ "${{ inputs.type }}" != "diff" ]] && exit 0        
 
         echo "## Perform diff"
